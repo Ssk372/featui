@@ -29,8 +29,17 @@ func TestLoadCreatesDefaultConfig(t *testing.T) {
 	if !cfg.Notify {
 		t.Fatal("notify debería estar activo por defecto")
 	}
-	if cfg.WatchProfile {
-		t.Fatal("watch_profile debería estar apagado por defecto")
+	if !cfg.AutoTrack {
+		t.Fatal("auto_track debería estar activo por defecto")
+	}
+	if cfg.PollInterval != DefaultPollInterval {
+		t.Fatalf("poll_interval = %d, quiero %d", cfg.PollInterval, DefaultPollInterval)
+	}
+	if !cfg.Sound {
+		t.Fatal("sound debería estar activo por defecto")
+	}
+	if cfg.SoundFile != "" {
+		t.Fatalf("sound_file = %q, quiero vacío", cfg.SoundFile)
 	}
 	if len(cfg.RecentAppIDs) != 0 {
 		t.Fatalf("recent_app_ids = %v, quiero vacío", cfg.RecentAppIDs)
@@ -63,7 +72,8 @@ func TestLoadMigratesDefaultAppID(t *testing.T) {
   "steam_api_key": "file-key",
   "steam_id_64": "",
   "default_app_id": 49520,
-  "max_visible_count": 15
+  "max_visible_count": 15,
+  "watch_profile": true
 }`
 	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(legacy), 0o600); err != nil {
 		t.Fatal(err)
@@ -86,6 +96,12 @@ func TestLoadMigratesDefaultAppID(t *testing.T) {
 	}
 	if strings.Contains(string(raw), "default_app_id") {
 		t.Fatal("la clave legada debería haberse eliminado del archivo")
+	}
+	if strings.Contains(string(raw), "watch_profile") {
+		t.Fatal("watch_profile debería haberse eliminado del archivo")
+	}
+	if !strings.Contains(string(raw), "auto_track") {
+		t.Fatal("deberían escribirse las claves nuevas")
 	}
 }
 
@@ -164,6 +180,34 @@ func TestNormalizeDropsInvalidSteamID(t *testing.T) {
 	}
 	if cfg.Locale != DefaultLocale || cfg.MaxVisibleCount != DefaultMaxVisibleCount {
 		t.Fatal("normalize no aplicó los valores por defecto")
+	}
+}
+
+func TestNormalizeClampsPollInterval(t *testing.T) {
+	tests := []struct {
+		in   int
+		want int
+	}{
+		{in: 0, want: DefaultPollInterval},
+		{in: -5, want: DefaultPollInterval},
+		{in: 2, want: MinPollInterval},
+		{in: 60, want: 60},
+		{in: 9999, want: MaxPollInterval},
+	}
+	for _, tt := range tests {
+		cfg := Config{PollInterval: tt.in}
+		cfg.normalize()
+		if cfg.PollInterval != tt.want {
+			t.Fatalf("poll_interval %d → %d, quiero %d", tt.in, cfg.PollInterval, tt.want)
+		}
+	}
+}
+
+func TestNormalizeTrimsSoundFile(t *testing.T) {
+	cfg := Config{SoundFile: "  /tmp/a.ogg  "}
+	cfg.normalize()
+	if cfg.SoundFile != "/tmp/a.ogg" {
+		t.Fatalf("sound_file = %q", cfg.SoundFile)
 	}
 }
 

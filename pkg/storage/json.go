@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"github.com/Ssk372/featui/internal/fsutil"
@@ -30,17 +31,13 @@ type CachedSchema struct {
 
 // New crea (si hace falta) los directorios de datos y caché.
 //
-// Respeta XDG_DATA_HOME y XDG_CACHE_HOME. El progreso va a
-// <datos>/featui/progress y la caché a <caché>/featui.
+// El progreso va a <datos>/featui/progress y la caché a <caché>/featui. En
+// Linux respeta XDG_DATA_HOME; en macOS usa ~/Library/Application Support y en
+// Windows %LocalAppData%.
 func New() (*Storage, error) {
-	dataHome, err := os.UserHomeDir()
+	dataHome, err := dataHome()
 	if err != nil {
-		return nil, fmt.Errorf("no se pudo localizar el home del usuario: %w", err)
-	}
-	if xdg := os.Getenv("XDG_DATA_HOME"); xdg != "" {
-		dataHome = xdg
-	} else {
-		dataHome = filepath.Join(dataHome, ".local", "share")
+		return nil, err
 	}
 
 	cacheHome, err := os.UserCacheDir()
@@ -59,6 +56,33 @@ func New() (*Storage, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// dataHome resuelve el directorio base de datos según el sistema operativo.
+func dataHome() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("no se pudo localizar el home del usuario: %w", err)
+	}
+	return dataHomeFor(runtime.GOOS, home), nil
+}
+
+// dataHomeFor es la parte pura de dataHome, fácil de testear.
+func dataHomeFor(osName, home string) string {
+	switch osName {
+	case "windows":
+		if local := os.Getenv("LocalAppData"); local != "" {
+			return local
+		}
+		return filepath.Join(home, "AppData", "Local")
+	case "darwin":
+		return filepath.Join(home, "Library", "Application Support")
+	default:
+		if xdg := os.Getenv("XDG_DATA_HOME"); xdg != "" {
+			return xdg
+		}
+		return filepath.Join(home, ".local", "share")
+	}
 }
 
 // DataDir devuelve el directorio donde viven los progresos.

@@ -4,6 +4,9 @@
   "locale": "spanish",
   "max_visible_count": 15,
   "notify": true,
-  "watch_profile": false,
+  "auto_track": true,
+  "poll_interval": 30,
+  "sound": true,
+  "sound_file": "",
   "recent_app_ids": []
 }

@@ -4,13 +4,17 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/Ssk372/featui/pkg/autotrack"
 	"github.com/Ssk372/featui/pkg/config"
 	"github.com/Ssk372/featui/pkg/model"
+	"github.com/Ssk372/featui/pkg/steam"
 	"github.com/Ssk372/featui/pkg/storage"
 )
 
@@ -18,14 +22,56 @@ type fakeSteam struct {
 	schema []model.Achievement
 	title  string
 	err    error
+	player func() (map[string]steam.PlayerAchievement, error)
 }
 
 func (f fakeSteam) FetchGameSchema(context.Context, int, string) ([]model.Achievement, string, error) {
 	return f.schema, f.title, f.err
 }
 
-func (f fakeSteam) FetchPlayerAchievements(context.Context, string, int) (map[string]bool, error) {
+func (f fakeSteam) FetchPlayerAchievements(context.Context, string, int) (map[string]steam.PlayerAchievement, error) {
+	if f.player != nil {
+		return f.player()
+	}
 	return nil, errors.New("no usado en tests")
+}
+
+type fakeNotifier struct {
+	names []string
+}
+
+func (f *fakeNotifier) SendAchievementNotification(_, name, _, _, _ string) error {
+	f.names = append(f.names, name)
+	return nil
+}
+
+type fakeSound struct {
+	plays int
+}
+
+func (f *fakeSound) Play() error {
+	f.plays++
+	return nil
+}
+
+func (f *fakeSound) Warning() string { return "" }
+
+// runCmd ejecuta un comando y, si es un batch, sus comandos internos.
+func runCmd(t *testing.T, cmd tea.Cmd) {
+	t.Helper()
+	if cmd == nil {
+		return
+	}
+	msg := cmd()
+	if batch, ok := msg.(tea.BatchMsg); ok {
+		for _, inner := range batch {
+			runCmd(t, inner)
+		}
+	}
+}
+
+func keyMsg(key string) tea.KeyMsg {
+	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)}
 }
 
 func newTestStore(t *testing.T) *storage.Storage {
@@ -277,5 +323,315 @@ func TestStaleGameReadyIsIgnored(t *testing.T) {
 	}
 	if got.Screen != ScreenAppID {
 		t.Fatal("una respuesta obsoleta no debe cambiar de pantalla")
+	}
+}
+
+func readyAutoModel(t *testing.T) (Model, *storage.Storage) {
+	t.Helper()
+	store := newTestStore(t)
+	game := model.GameProgress{
+		AppID: 49520,
+		Title: "Juego",
+		Achievements: []model.Achievement{
+			{APIName: "A", DisplayName: "A"},
+			{APIName: "B", DisplayName: "B"},
+		},
+	}
+	if err := store.SaveProgress(game); err != nil {
+		t.Fatal(err)
+	}
+
+	m := Model{
+		Screen:  ScreenReady,
+		AppID:   49520,
+		Game:    game,
+		Store:   store,
+		Config:  config.Config{AutoTrack: true, SteamID64: "76561198000000000", PollInterval: 30},
+		Tracker: autotrack.New(),
+		seq:     1,
+	}
+	return m, store
+}
+
+func TestReferenceSeedsBaselineWithoutUnlocking(t *testing.T) {
+	m, store := readyAutoModel(t)
+	states := map[string]steam.PlayerAchievement{
+		"A": {Unlocked: true, UnlockTime: time.Unix(1700000000, 0)},
+		"B": {},
+	}
+
+	updated, cmd := m.Update(referenceMsg{Seq: 1, AppID: 49520, States: states})
+	got := updated.(Model)
+
+	if got.Game.CompletedCount() != 0 {
+		t.Fatalf("el baseline no debe desbloquear nada: %+v", got.Game.Achievements)
+	}
+	if !got.AutoActive {
+		t.Fatal("el auto-track debería quedar activo")
+	}
+	if !got.Reference["A"] {
+		t.Fatal("el badge de Steam debería reflejar A")
+	}
+	if got.LastPoll.IsZero() {
+		t.Fatal("debería registrarse la hora de la última sincronización")
+	}
+	if cmd == nil {
+		t.Fatal("debería programarse el siguiente sondeo")
+	}
+
+	saved, err := store.LoadProgress(49520)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.CompletedCount() != 0 {
+		t.Fatal("el baseline no debe persistir logros como completados")
+	}
+}
+
+func TestPollResultUnlocksTransitionWithSteamTime(t *testing.T) {
+	m, store := readyAutoModel(t)
+	m.AutoActive = true
+	m.Tracker.Diff(map[string]autotrack.State{
+		"A": {Unlocked: false},
+		"B": {Unlocked: false},
+	})
+
+	unlockAt := time.Date(2026, 11, 16, 9, 30, 0, 0, time.UTC)
+	states := map[string]steam.PlayerAchievement{
+		"A": {Unlocked: true, UnlockTime: unlockAt},
+		"B": {Unlocked: false},
+	}
+
+	updated, cmd := m.Update(pollResultMsg{Seq: 1, AppID: 49520, States: states})
+	got := updated.(Model)
+
+	if got.Game.CompletedCount() != 1 {
+		t.Fatalf("completados = %d, quiero 1", got.Game.CompletedCount())
+	}
+	ach := got.Game.Achievements[0]
+	if !ach.Completed || ach.Source != model.SourceSteam {
+		t.Fatalf("logro mal marcado: %+v", ach)
+	}
+	if ach.UnlockedAt == nil || !ach.UnlockedAt.Equal(unlockAt) {
+		t.Fatalf("unlocked_at = %v, quiero %v", ach.UnlockedAt, unlockAt)
+	}
+	if cmd == nil {
+		t.Fatal("debería programarse el siguiente sondeo")
+	}
+
+	saved, err := store.LoadProgress(49520)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.CompletedCount() != 1 || saved.Achievements[0].Source != model.SourceSteam {
+		t.Fatalf("no se persistió el desbloqueo: %+v", saved.Achievements[0])
+	}
+}
+
+func TestManualUnmarkSurvivesNextPoll(t *testing.T) {
+	m, _ := readyAutoModel(t)
+	m.AutoActive = true
+	unlockAt := time.Date(2026, 11, 16, 9, 30, 0, 0, time.UTC)
+	states := map[string]steam.PlayerAchievement{
+		"A": {Unlocked: true, UnlockTime: unlockAt},
+		"B": {},
+	}
+
+	// Baseline pendiente y luego transición.
+	m.Tracker.Diff(map[string]autotrack.State{"A": {Unlocked: false}, "B": {Unlocked: false}})
+	updated, _ := m.Update(pollResultMsg{Seq: 1, AppID: 49520, States: states})
+	m = updated.(Model)
+	if m.Game.CompletedCount() != 1 {
+		t.Fatal("el primer sondeo debía desbloquear A")
+	}
+
+	// Desmarque manual.
+	m.toggleCurrent()
+	if m.Game.CompletedCount() != 0 {
+		t.Fatal("el desmarque manual falló")
+	}
+
+	// Steam sigue diciendo que A está desbloqueado: no debe revertirse.
+	updated, _ = m.Update(pollResultMsg{Seq: 1, AppID: 49520, States: states})
+	m = updated.(Model)
+	if m.Game.CompletedCount() != 0 {
+		t.Fatalf("el sondeo revirtió el desmarque manual: %+v", m.Game.Achievements)
+	}
+}
+
+func TestPollDelayBacksOff(t *testing.T) {
+	m := Model{Config: config.Config{PollInterval: 30}}
+	tests := []struct {
+		errors int
+		want   time.Duration
+	}{
+		{errors: 0, want: 30 * time.Second},
+		{errors: 1, want: 60 * time.Second},
+		{errors: 2, want: 120 * time.Second},
+		{errors: 3, want: 5 * time.Minute},
+		{errors: 20, want: 5 * time.Minute},
+	}
+	for _, tt := range tests {
+		m.PollErrors = tt.errors
+		if got := m.pollDelay(); got != tt.want {
+			t.Fatalf("%d errores → %v, quiero %v", tt.errors, got, tt.want)
+		}
+	}
+
+	if got := (Model{Config: config.Config{PollInterval: 300}}).pollDelay(); got != 5*time.Minute {
+		t.Fatalf("el backoff debe quedar acotado a 5 min, got %v", got)
+	}
+}
+
+func TestPrivateProfileDisablesAutoTrack(t *testing.T) {
+	m, _ := readyAutoModel(t)
+	updated, cmd := m.Update(referenceMsg{Seq: 1, AppID: 49520, Err: steam.ErrPrivateProfile})
+	got := updated.(Model)
+
+	if got.AutoActive {
+		t.Fatal("un perfil privado debe desactivar el auto-track")
+	}
+	if !strings.Contains(got.AutoWarning, "público") {
+		t.Fatalf("aviso inesperado: %q", got.AutoWarning)
+	}
+	if cmd != nil {
+		t.Fatal("no debe seguir sondeando un perfil privado")
+	}
+}
+
+func TestSyncKeyConfirmsAndAdoptsSteamUnlocks(t *testing.T) {
+	m, store := readyAutoModel(t)
+	unlockAt := time.Date(2026, 11, 10, 22, 0, 0, 0, time.UTC)
+	m.Steam = fakeSteam{player: func() (map[string]steam.PlayerAchievement, error) {
+		return map[string]steam.PlayerAchievement{
+			"A": {Unlocked: true, UnlockTime: unlockAt},
+			"B": {Unlocked: false},
+		}, nil
+	}}
+
+	updated, _ := m.Update(keyMsg("S"))
+	m = updated.(Model)
+	if !m.ConfirmSync {
+		t.Fatal("S debe pedir confirmación")
+	}
+
+	updated, _ = m.Update(keyMsg("n"))
+	m = updated.(Model)
+	if m.ConfirmSync {
+		t.Fatal("n debe cancelar la sincronización")
+	}
+	if m.Game.CompletedCount() != 0 {
+		t.Fatal("cancelar no debe marcar nada")
+	}
+
+	updated, _ = m.Update(keyMsg("S"))
+	m = updated.(Model)
+	updated, cmd := m.Update(keyMsg("y"))
+	m = updated.(Model)
+	if m.ConfirmSync {
+		t.Fatal("la confirmación debe cerrarse")
+	}
+	if cmd == nil {
+		t.Fatal("y debe lanzar la consulta a Steam")
+	}
+
+	msg := cmd()
+	syncMsg, ok := msg.(syncDoneMsg)
+	if !ok {
+		t.Fatalf("mensaje = %T, quiero syncDoneMsg", msg)
+	}
+
+	updated, _ = m.Update(syncMsg)
+	m = updated.(Model)
+	if m.Game.CompletedCount() != 1 {
+		t.Fatalf("debería adoptar solo A, completados = %d", m.Game.CompletedCount())
+	}
+	ach := m.Game.Achievements[0]
+	if ach.Source != model.SourceSteam || ach.UnlockedAt == nil || !ach.UnlockedAt.Equal(unlockAt) {
+		t.Fatalf("adopción incorrecta: %+v", ach)
+	}
+
+	saved, err := store.LoadProgress(49520)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.CompletedCount() != 1 {
+		t.Fatal("la adopción no se persistió")
+	}
+}
+
+func TestManualToggleNotifiesAndPlaysSound(t *testing.T) {
+	store := newTestStore(t)
+	game := model.GameProgress{
+		AppID:        1,
+		Title:        "Juego",
+		Achievements: []model.Achievement{{APIName: "A", DisplayName: "A"}},
+	}
+	if err := store.SaveProgress(game); err != nil {
+		t.Fatal(err)
+	}
+
+	notif := &fakeNotifier{}
+	snd := &fakeSound{}
+	m := Model{
+		Screen:   ScreenReady,
+		AppID:    1,
+		Game:     game,
+		Store:    store,
+		Config:   config.Config{Notify: true, Sound: true},
+		Notifier: notif,
+		Sound:    snd,
+	}
+
+	runCmd(t, m.toggleCurrent())
+
+	if len(notif.names) != 1 || notif.names[0] != "A" {
+		t.Fatalf("notificaciones = %v", notif.names)
+	}
+	if snd.plays != 1 {
+		t.Fatalf("reproducciones = %d, quiero 1", snd.plays)
+	}
+}
+
+func TestMultipleUnlocksUseSingleSummaryNotification(t *testing.T) {
+	notif := &fakeNotifier{}
+	snd := &fakeSound{}
+	m := Model{
+		Config:   config.Config{Notify: true, Sound: true},
+		Notifier: notif,
+		Sound:    snd,
+	}
+
+	cmd := m.achievementFeedback([]model.Achievement{
+		{DisplayName: "A"},
+		{DisplayName: "B"},
+	})
+	runCmd(t, cmd)
+
+	if len(notif.names) != 1 || !strings.Contains(notif.names[0], "2 logros") {
+		t.Fatalf("debería haber una sola notificación resumen: %v", notif.names)
+	}
+	if snd.plays != 1 {
+		t.Fatalf("debería sonar una sola vez: %d", snd.plays)
+	}
+}
+
+func TestStalePollResultIsIgnored(t *testing.T) {
+	m, _ := readyAutoModel(t)
+	m.AutoActive = true
+	m.seq = 2
+	m.Tracker.Diff(map[string]autotrack.State{"A": {Unlocked: false}, "B": {Unlocked: false}})
+
+	updated, _ := m.Update(pollResultMsg{
+		Seq:   1, // de una carga anterior
+		AppID: 49520,
+		States: map[string]steam.PlayerAchievement{
+			"A": {Unlocked: true, UnlockTime: time.Now()},
+			"B": {},
+		},
+	})
+	got := updated.(Model)
+	if got.Game.CompletedCount() != 0 {
+		t.Fatal("un resultado de un sondeo viejo no debe aplicarse")
 	}
 }

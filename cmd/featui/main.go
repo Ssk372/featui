@@ -9,6 +9,7 @@ import (
 
 	"github.com/Ssk372/featui/pkg/config"
 	"github.com/Ssk372/featui/pkg/notifier"
+	"github.com/Ssk372/featui/pkg/sound"
 	"github.com/Ssk372/featui/pkg/steam"
 	"github.com/Ssk372/featui/pkg/storage"
 	"github.com/Ssk372/featui/pkg/tui"
@@ -44,7 +45,14 @@ func run() error {
 	client := steam.NewClient(cfg.APIKey())
 	notif := notifier.New("FeatUI")
 
-	program := tea.NewProgram(tui.NewModel(cfg, store, client, notif), tea.WithAltScreen())
+	// Se asigna solo si está activo: pasar un *sound.Player nil a una interfaz
+	// dejaría una interfaz no nula apuntando a nil.
+	var snd tui.SoundPlayer
+	if cfg.Sound {
+		snd = sound.New(cfg.SoundFile)
+	}
+
+	program := tea.NewProgram(tui.NewModel(cfg, store, client, notif, snd), tea.WithAltScreen())
 	if _, err := program.Run(); err != nil {
 		return fmt.Errorf("error ejecutando FeatUI: %w", err)
 	}

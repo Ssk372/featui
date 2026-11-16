@@ -103,9 +103,16 @@ func (c *Client) FetchGameSchema(ctx context.Context, appID int, locale string) 
 	return achievements, resp.Game.GameName, nil
 }
 
+// PlayerAchievement es el estado real de un logro en Steam.
+type PlayerAchievement struct {
+	Unlocked   bool
+	UnlockTime time.Time
+}
+
 // FetchPlayerAchievements devuelve el estado real del jugador. FeatUI lo usa
-// solo como referencia visual: nunca modifica el progreso local.
-func (c *Client) FetchPlayerAchievements(ctx context.Context, steamID string, appID int) (map[string]bool, error) {
+// para el badge informativo y para detectar desbloqueos nuevos mientras la app
+// está abierta. Nunca escribe nada en Steam.
+func (c *Client) FetchPlayerAchievements(ctx context.Context, steamID string, appID int) (map[string]PlayerAchievement, error) {
 	if !ValidSteamID(steamID) {
 		return nil, fmt.Errorf("SteamID64 inválido: %q", steamID)
 	}
@@ -122,8 +129,9 @@ func (c *Client) FetchPlayerAchievements(ctx context.Context, steamID string, ap
 			Success      bool   `json:"success"`
 			Error        string `json:"error"`
 			Achievements []struct {
-				APIName  string `json:"apiname"`
-				Achieved int    `json:"achieved"`
+				APIName    string `json:"apiname"`
+				Achieved   int    `json:"achieved"`
+				UnlockTime int64  `json:"unlocktime"`
 			} `json:"achievements"`
 		} `json:"playerstats"`
 	}
@@ -137,9 +145,13 @@ func (c *Client) FetchPlayerAchievements(ctx context.Context, steamID string, ap
 		return nil, classifyPlayerStatsError(stats.Error)
 	}
 
-	completed := make(map[string]bool, len(stats.Achievements))
+	completed := make(map[string]PlayerAchievement, len(stats.Achievements))
 	for _, item := range stats.Achievements {
-		completed[item.APIName] = item.Achieved == 1
+		state := PlayerAchievement{Unlocked: item.Achieved == 1}
+		if state.Unlocked && item.UnlockTime > 0 {
+			state.UnlockTime = time.Unix(item.UnlockTime, 0).UTC()
+		}
+		completed[item.APIName] = state
 	}
 	return completed, nil
 }

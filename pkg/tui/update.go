@@ -12,14 +12,18 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/Ssk372/featui/pkg/appid"
+	"github.com/Ssk372/featui/pkg/autotrack"
 	"github.com/Ssk372/featui/pkg/model"
+	"github.com/Ssk372/featui/pkg/steam"
 	"github.com/Ssk372/featui/pkg/storage"
-	"github.com/Ssk372/featui/pkg/watcher"
 )
 
 // SchemaTTL es cuánto tiempo se reutiliza el esquema cacheado antes de volver a
 // preguntar a Steam.
 const SchemaTTL = 24 * time.Hour
+
+// maxBackoff acota el sondeo cuando Steam falla repetidamente.
+const maxBackoff = 5 * time.Minute
 
 type gameReadyMsg struct {
 	Seq      int
@@ -34,9 +38,29 @@ type gameErrMsg struct {
 }
 
 type referenceMsg struct {
-	AppID     int
-	Completed map[string]bool
-	Err       error
+	Seq    int
+	AppID  int
+	States map[string]steam.PlayerAchievement
+	Err    error
+}
+
+type pollTickMsg struct {
+	AppID int
+	Seq   int
+}
+
+type pollResultMsg struct {
+	Seq    int
+	AppID  int
+	States map[string]steam.PlayerAchievement
+	Err    error
+}
+
+type syncDoneMsg struct {
+	Seq    int
+	AppID  int
+	States map[string]steam.PlayerAchievement
+	Err    error
 }
 
 type resetDoneMsg struct {
@@ -155,21 +179,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Seq != m.seq {
 			return m, nil // respuesta obsoleta
 		}
-		m.stopWatcher()
+		m.stopAuto()
 		m.Game = msg.Progress
 		m.AppID = msg.Progress.AppID
 		m.Screen = ScreenReady
 		m.Cursor = 0
 		m.Filter = FilterAll
 		m.ConfirmReset = false
+		m.ConfirmSync = false
 		m.Searching = false
 		m.Search.SetValue("")
 		m.Search.Blur()
 		m.Input.Blur()
 		m.Warning = msg.Warning
+		m.AutoWarning = ""
+		m.PollErrors = 0
+		m.LastPoll = time.Time{}
 		m.Err = nil
 		m.Reference = nil
-		m.Watcher = watcher.New(m.AppID)
+		m.Tracker = autotrack.New()
 		m.StatusMsg = fmt.Sprintf("%s · %d logros", m.Game.Title, m.Game.Total())
 
 		if m.Config.AddRecentAppID(m.AppID) {
@@ -177,11 +205,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.loadRecents()
 
-		cmds := make([]tea.Cmd, 0, 2)
-		if cmd := m.referenceCmd(); cmd != nil {
-			cmds = append(cmds, cmd)
-		}
-		if cmd := m.armWatcher(); cmd != nil {
+		cmds := make([]tea.Cmd, 0, 1)
+		if m.Config.AutoTrack {
+			if m.Config.SteamID64 == "" {
+				m.AutoWarning = "auto-track desactivado: falta steam_id_64 (perfil público de Steam)"
+			} else if cmd := m.referenceCmd(); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+		} else if cmd := m.referenceCmd(); cmd != nil {
+			// Aunque el auto-track esté apagado, el badge informativo sigue.
 			cmds = append(cmds, cmd)
 		}
 		if len(cmds) > 0 {
@@ -193,7 +225,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Seq != m.seq {
 			return m, nil
 		}
-		m.stopWatcher()
+		m.stopAuto()
 		m.Screen = ScreenError
 		m.AppID = msg.AppID
 		m.Err = msg.Err
@@ -201,13 +233,107 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case referenceMsg:
-		if msg.AppID != m.AppID || m.Screen != ScreenReady {
+		if msg.Seq != m.seq || msg.AppID != m.AppID || m.Screen != ScreenReady {
 			return m, nil
 		}
-		if msg.Err == nil {
-			m.Reference = msg.Completed
+		if msg.Err != nil {
+			if !m.Config.AutoTrack {
+				return m, nil
+			}
+			if autoDisabledBy(msg.Err) {
+				m.AutoActive = false
+				m.AutoWarning = autoWarningText(msg.Err)
+				return m, nil
+			}
+			// Error transitorio: se mantiene el auto-track con backoff; el
+			// primer sondeo correcto establecerá la línea base.
+			m.PollErrors = 1
+			m.AutoActive = true
+			m.AutoWarning = "no se pudo consultar Steam: " + msg.Err.Error()
+			return m, m.schedulePoll(m.AppID)
 		}
-		return m, nil
+
+		m.Reference = unlockedSet(msg.States)
+		m.AutoWarning = ""
+		if !m.Config.AutoTrack {
+			return m, nil
+		}
+		m.Tracker.Diff(toStates(msg.States)) // solo línea base: no desbloquea nada
+		m.LastPoll = time.Now()
+		m.PollErrors = 0
+		m.AutoActive = true
+		return m, m.schedulePoll(m.AppID)
+
+	case pollTickMsg:
+		if msg.AppID != m.AppID || msg.Seq != m.seq || m.Screen != ScreenReady || !m.AutoActive {
+			return m, nil
+		}
+		return m, m.pollCmd(msg.AppID)
+
+	case pollResultMsg:
+		if msg.Seq != m.seq || msg.AppID != m.AppID || m.Screen != ScreenReady || !m.AutoActive {
+			return m, nil
+		}
+		if msg.Err != nil {
+			m.PollErrors++
+			if autoDisabledBy(msg.Err) {
+				m.AutoActive = false
+				m.AutoWarning = autoWarningText(msg.Err)
+				return m, nil
+			}
+			if m.PollErrors >= 3 {
+				m.AutoWarning = fmt.Sprintf(
+					"auto-track con problemas; reintentando cada %s: %s",
+					shortDuration(m.pollDelay()), msg.Err.Error(),
+				)
+			}
+			return m, m.schedulePoll(m.AppID)
+		}
+
+		m.AutoWarning = ""
+		m.PollErrors = 0
+		m.LastPoll = time.Now()
+		m.Reference = unlockedSet(msg.States)
+
+		unlocks := m.Tracker.Diff(toStates(msg.States))
+		next := m.schedulePoll(m.AppID)
+		if len(unlocks) == 0 {
+			return m, next
+		}
+
+		changed := m.applyUnlocks(unlocks, model.SourceSteam)
+		if len(changed) == 0 {
+			return m, next
+		}
+		return m, mergeCmds(next, m.achievementFeedback(changed))
+
+	case syncDoneMsg:
+		if msg.Seq != m.seq || msg.AppID != m.AppID || m.Screen != ScreenReady {
+			return m, nil
+		}
+		if msg.Err != nil {
+			m.AutoWarning = "no se pudo sincronizar con Steam: " + msg.Err.Error()
+			m.StatusMsg = "Sincronización cancelada"
+			return m, nil
+		}
+
+		m.AutoWarning = ""
+		m.Reference = unlockedSet(msg.States)
+		if m.Tracker != nil {
+			// Mantiene la línea base al día para no repetir estos avisos.
+			m.Tracker.Diff(toStates(msg.States))
+		}
+
+		changed := m.applyUnlocks(autotrack.Adopt(toStates(msg.States)), model.SourceSteam)
+		switch {
+		case len(changed) == 0:
+			m.StatusMsg = "Todo al día: no hay logros nuevos en Steam"
+		case len(changed) == 1:
+			m.StatusMsg = "Sincronizado desde Steam: " + changed[0].DisplayName
+		default:
+			m.StatusMsg = fmt.Sprintf("Sincronizados %d logros desde Steam", len(changed))
+		}
+		return m, m.achievementFeedback(changed)
 
 	case resetDoneMsg:
 		if msg.AppID != m.AppID {
@@ -221,20 +347,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ConfirmReset = false
 		m.ClampCursor()
 		m.StatusMsg = fmt.Sprintf("Partida reiniciada · backup en %s", msg.Backup)
-		return m, nil
-
-	case watcher.Msg:
-		m.WatchActive = false
-		if m.Screen == ScreenReady && msg.AppID == m.AppID {
-			if progress, err := m.Store.LoadProgress(m.AppID); err == nil {
-				m.Game = progress
-				m.ClampCursor()
-				m.StatusMsg = "Guardado detectado en el juego · progreso recargado"
-			}
-		}
-		if cmd := m.armWatcher(); cmd != nil {
-			return m, cmd
-		}
 		return m, nil
 	}
 
@@ -253,7 +365,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
 
 	if key == "ctrl+c" {
-		m.shutdownWatcher()
+		m.shutdown()
 		return m, tea.Quit
 	}
 
@@ -269,6 +381,19 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "n", "N", "esc":
 			m.ConfirmReset = false
 			m.StatusMsg = "Reinicio cancelado"
+		}
+		return m, nil
+	}
+
+	if m.ConfirmSync {
+		switch key {
+		case "y", "Y":
+			m.ConfirmSync = false
+			m.StatusMsg = "Consultando Steam..."
+			return m, m.syncCmd()
+		case "n", "N", "esc":
+			m.ConfirmSync = false
+			m.StatusMsg = "Sincronización cancelada"
 		}
 		return m, nil
 	}
@@ -334,7 +459,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m Model) handleAppIDKey(key string, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch key {
 	case "esc":
-		m.shutdownWatcher()
+		m.shutdown()
 		return m, tea.Quit
 	case "enter":
 		value := strings.TrimSpace(m.Input.Value())
@@ -378,15 +503,17 @@ func (m Model) handleAppIDKey(key string, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m Model) handleReadyKey(key string) (tea.Model, tea.Cmd) {
 	switch key {
 	case "q":
-		m.shutdownWatcher()
+		m.shutdown()
 		return m, tea.Quit
 
 	case "esc":
-		m.stopWatcher()
+		m.stopAuto()
 		m.Screen = ScreenAppID
 		m.AppID = 0
 		m.Game = model.GameProgress{}
 		m.Reference = nil
+		m.Tracker = autotrack.New()
+		m.AutoWarning = ""
 		m.Cursor = 0
 		m.Warning = ""
 		m.StatusMsg = ""
@@ -426,11 +553,20 @@ func (m Model) handleReadyKey(key string) (tea.Model, tea.Cmd) {
 		seq := m.nextSeq()
 		m.Screen = ScreenLoading
 		m.StatusMsg = "Actualizando desde Steam..."
-		m.stopWatcher()
+		m.stopAuto()
 		return m, m.openGameCmd(m.AppID, true, seq)
+
+	case "S":
+		if m.Config.SteamID64 == "" {
+			m.StatusMsg = "Configura steam_id_64 para sincronizar con Steam"
+			return m, nil
+		}
+		m.ConfirmSync = true
+		m.ConfirmReset = false
 
 	case "R":
 		m.ConfirmReset = true
+		m.ConfirmSync = false
 
 	case "?":
 		m.ShowHelp = !m.ShowHelp
@@ -451,13 +587,15 @@ func (m Model) startGame(id int, force bool) (tea.Model, tea.Cmd) {
 	m.Cursor = 0
 	m.Filter = FilterAll
 	m.ConfirmReset = false
+	m.ConfirmSync = false
 	m.Searching = false
 	m.Search.SetValue("")
 	m.Search.Blur()
 	m.Input.SetValue("")
 	m.Input.Blur()
 	m.Reference = nil
-	m.stopWatcher()
+	m.Tracker = autotrack.New()
+	m.stopAuto()
 
 	return m, m.openGameCmd(id, force, seq)
 }
@@ -559,16 +697,115 @@ func (m *Model) toggleCurrent() tea.Cmd {
 	}
 	m.ClampCursor()
 
-	if ach.Completed && m.Config.Notify && m.Notifier != nil {
-		return m.notifyCmd(*ach)
+	if ach.Completed {
+		return m.achievementFeedback([]model.Achievement{*ach})
 	}
 	return nil
 }
 
-func (m Model) notifyCmd(ach model.Achievement) tea.Cmd {
+// applyUnlocks marca en el progreso local los logros que Steam desbloqueó.
+// Devuelve solo los que cambiaron de verdad, para no notificar duplicados.
+func (m *Model) applyUnlocks(unlocks []autotrack.Unlock, source model.UnlockSource) []model.Achievement {
+	if len(unlocks) == 0 {
+		return nil
+	}
+
+	positions := make(map[string]int, len(m.Game.Achievements))
+	for i := range m.Game.Achievements {
+		positions[m.Game.Achievements[i].APIName] = i
+	}
+
+	changed := make([]model.Achievement, 0, len(unlocks))
+	for _, unlock := range unlocks {
+		position, ok := positions[unlock.APIName]
+		if !ok {
+			continue
+		}
+		ach := &m.Game.Achievements[position]
+		if ach.Completed {
+			continue
+		}
+
+		at := unlock.UnlockedAt
+		if at.IsZero() {
+			at = time.Now()
+		}
+		ach.Completed = true
+		ach.UnlockedAt = &at
+		ach.Source = source
+		changed = append(changed, *ach)
+	}
+
+	if len(changed) == 0 {
+		return nil
+	}
+
+	m.Game.LastUpdated = time.Now()
+	if err := m.Store.SaveProgress(m.Game); err != nil {
+		m.Warning = "no se pudo guardar el progreso: " + err.Error()
+	}
+	m.ClampCursor()
+
+	if len(changed) == 1 {
+		m.StatusMsg = "Logro desbloqueado en Steam: " + changed[0].DisplayName
+	} else {
+		m.StatusMsg = fmt.Sprintf("%d logros desbloqueados en Steam", len(changed))
+	}
+	return changed
+}
+
+// achievementFeedback notifica y suena, respetando notify y sound por separado.
+func (m Model) achievementFeedback(achievements []model.Achievement) tea.Cmd {
+	cmds := make([]tea.Cmd, 0, 2)
+
+	if len(achievements) > 0 && m.Config.Notify && m.Notifier != nil {
+		cmds = append(cmds, m.notifyCmd(achievements))
+	}
+	if m.Config.Sound && m.Sound != nil {
+		player := m.Sound
+		cmds = append(cmds, func() tea.Msg {
+			_ = player.Play()
+			return nil
+		})
+	}
+
+	switch len(cmds) {
+	case 0:
+		return nil
+	case 1:
+		return cmds[0]
+	default:
+		return tea.Batch(cmds...)
+	}
+}
+
+func (m Model) notifyCmd(achievements []model.Achievement) tea.Cmd {
 	notif, gameTitle := m.Notifier, m.Game.Title
+	items := append([]model.Achievement(nil), achievements...)
+
 	return func() tea.Msg {
-		_ = notif.SendAchievementNotification(gameTitle, ach.DisplayName, ach.Description, ach.IconURL, ach.APIName)
+		if len(items) == 1 {
+			ach := items[0]
+			_ = notif.SendAchievementNotification(gameTitle, ach.DisplayName, ach.Description, ach.IconURL, ach.APIName)
+			return nil
+		}
+
+		names := make([]string, 0, len(items))
+		for _, ach := range items {
+			names = append(names, ach.DisplayName)
+		}
+		first := items[0]
+		summary := strings.Join(names, ", ")
+		if len([]rune(summary)) > 350 {
+			summary = string([]rune(summary)[:349]) + "…"
+		}
+		_ = notif.SendAchievementNotification(
+			gameTitle,
+			fmt.Sprintf("%d logros desbloqueados", len(items)),
+			summary,
+			first.IconURL,
+			"summary-"+first.APIName,
+		)
 		return nil
 	}
 }
@@ -577,40 +814,115 @@ func (m Model) referenceCmd() tea.Cmd {
 	if m.Config.SteamID64 == "" || m.AppID <= 0 {
 		return nil
 	}
-	api, steamID, appIDValue := m.Steam, m.Config.SteamID64, m.AppID
+	api, steamID, appIDValue, seq := m.Steam, m.Config.SteamID64, m.AppID, m.seq
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		completed, err := api.FetchPlayerAchievements(ctx, steamID, appIDValue)
-		return referenceMsg{AppID: appIDValue, Completed: completed, Err: err}
+		states, err := api.FetchPlayerAchievements(ctx, steamID, appIDValue)
+		return referenceMsg{Seq: seq, AppID: appIDValue, States: states, Err: err}
 	}
 }
 
-// armWatcher lanza un watcher nuevo, cancelando el anterior si lo hubiera.
-func (m *Model) armWatcher() tea.Cmd {
-	if !m.Config.WatchProfile || m.Watcher == nil || !m.Watcher.Available() {
-		m.WatchActive = false
+func (m Model) pollCmd(appIDValue int) tea.Cmd {
+	api, steamID, seq := m.Steam, m.Config.SteamID64, m.seq
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		states, err := api.FetchPlayerAchievements(ctx, steamID, appIDValue)
+		return pollResultMsg{Seq: seq, AppID: appIDValue, States: states, Err: err}
+	}
+}
+
+func (m Model) syncCmd() tea.Cmd {
+	api, steamID, appIDValue, seq := m.Steam, m.Config.SteamID64, m.AppID, m.seq
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		states, err := api.FetchPlayerAchievements(ctx, steamID, appIDValue)
+		return syncDoneMsg{Seq: seq, AppID: appIDValue, States: states, Err: err}
+	}
+}
+
+// schedulePoll encola el siguiente sondeo con backoff si Steam viene fallando.
+func (m Model) schedulePoll(appIDValue int) tea.Cmd {
+	if !m.AutoActive {
 		return nil
 	}
-
-	m.stopWatcher()
-	ctx, cancel := context.WithCancel(m.rootCtx)
-	m.watchCancel = cancel
-	m.WatchActive = true
-	return m.Watcher.Start(ctx)
+	seq := m.seq
+	return tea.Tick(m.pollDelay(), func(time.Time) tea.Msg {
+		return pollTickMsg{AppID: appIDValue, Seq: seq}
+	})
 }
 
-func (m *Model) stopWatcher() {
-	if m.watchCancel != nil {
-		m.watchCancel()
-		m.watchCancel = nil
+func (m Model) pollDelay() time.Duration {
+	base := time.Duration(m.Config.PollInterval) * time.Second
+	if base <= 0 {
+		base = 30 * time.Second
 	}
-	m.WatchActive = false
+
+	delay := base
+	switch {
+	case m.PollErrors <= 0:
+		delay = base
+	case m.PollErrors == 1:
+		delay = base * 2
+	case m.PollErrors == 2:
+		delay = base * 4
+	default:
+		delay = maxBackoff
+	}
+	if delay > maxBackoff {
+		delay = maxBackoff
+	}
+	return delay
 }
 
-func (m *Model) shutdownWatcher() {
-	m.stopWatcher()
-	if m.rootCancel != nil {
-		m.rootCancel()
+func shortDuration(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%d s", int(d.Seconds()))
+	case d%time.Minute == 0:
+		return fmt.Sprintf("%d min", int(d.Minutes()))
+	default:
+		return d.Round(time.Second).String()
 	}
+}
+
+func mergeCmds(first, second tea.Cmd) tea.Cmd {
+	switch {
+	case first == nil:
+		return second
+	case second == nil:
+		return first
+	default:
+		return tea.Batch(first, second)
+	}
+}
+
+// autoDisabledBy indica si el error es permanente para el auto-track.
+func autoDisabledBy(err error) bool {
+	return errors.Is(err, steam.ErrPrivateProfile) ||
+		errors.Is(err, steam.ErrNoStats) ||
+		errors.Is(err, steam.ErrInvalidAPIKey)
+}
+
+func autoWarningText(err error) string {
+	switch {
+	case errors.Is(err, steam.ErrPrivateProfile):
+		return "auto-track desactivado: el perfil de Steam no es público"
+	case errors.Is(err, steam.ErrNoStats):
+		return "auto-track desactivado: este juego no expone logros por API"
+	case errors.Is(err, steam.ErrInvalidAPIKey):
+		return "auto-track desactivado: la API key de Steam no es válida"
+	default:
+		return "auto-track: " + err.Error()
+	}
+}
+
+func (m *Model) stopAuto() {
+	m.AutoActive = false
+}
+
+func (m *Model) shutdown() {
+	m.stopAuto()
 }

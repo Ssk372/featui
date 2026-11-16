@@ -194,3 +194,37 @@ func TestPathsRespectXDG(t *testing.T) {
 		t.Fatalf("el directorio de caché no respeta XDG_CACHE_HOME: %s", store.CacheDir())
 	}
 }
+
+func TestDataHomeIsPortable(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", "/xdg/data")
+	t.Setenv("LocalAppData", `C:\Users\alguien\AppData\Local`)
+
+	home := "/home/alguien"
+	tests := []struct {
+		osName string
+		want   string
+	}{
+		{osName: "linux", want: "/xdg/data"},
+		{osName: "darwin", want: "/home/alguien/Library/Application Support"},
+		{osName: "windows", want: `C:\Users\alguien\AppData\Local`},
+	}
+	for _, tt := range tests {
+		if got := dataHomeFor(tt.osName, home); got != tt.want {
+			t.Fatalf("dataHomeFor(%q) = %q, quiero %q", tt.osName, got, tt.want)
+		}
+	}
+
+	t.Setenv("XDG_DATA_HOME", "")
+	if got := dataHomeFor("linux", home); got != "/home/alguien/.local/share" {
+		t.Fatalf("fallback Linux = %q", got)
+	}
+
+	// Sin LocalAppData se deriva del home real; se compara con el mismo
+	// filepath.Join para no depender del separador del sistema que ejecuta el test.
+	t.Setenv("LocalAppData", "")
+	winHome := `C:\Users\alguien`
+	want := filepath.Join(winHome, "AppData", "Local")
+	if got := dataHomeFor("windows", winHome); got != want {
+		t.Fatalf("fallback Windows = %q, quiero %q", got, want)
+	}
+}

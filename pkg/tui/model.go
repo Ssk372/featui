@@ -1,16 +1,16 @@
 package tui
 
 import (
-	"context"
 	"fmt"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/Ssk372/featui/pkg/autotrack"
 	"github.com/Ssk372/featui/pkg/config"
 	"github.com/Ssk372/featui/pkg/model"
-	"github.com/Ssk372/featui/pkg/notifier"
-	"github.com/Ssk372/featui/pkg/watcher"
+	"github.com/Ssk372/featui/pkg/steam"
 )
 
 type screen int
@@ -62,27 +62,35 @@ type Model struct {
 
 	Store    Store
 	Steam    SteamAPI
-	Notifier *notifier.Notifier
+	Notifier Notifier
+	Sound    SoundPlayer
+
+	// SoundWarning avisa de un sound_file inexistente o de la ausencia de
+	// reproductor. Es informativo y no impide usar FeatUI.
+	SoundWarning string
 
 	Input        textinput.Model
 	Search       textinput.Model
 	Searching    bool
 	Filter       filterMode
 	ConfirmReset bool
+	ConfirmSync  bool
 	ShowHelp     bool
 
 	Recents      []recentItem
 	RecentCursor int
 
-	// Reference es el estado real del jugador en Steam, solo para mostrar el
-	// badge informativo. Nunca se mezcla con el progreso local.
+	// Reference es el estado real del jugador en Steam, solo para el badge
+	// informativo. Nunca se mezcla con el progreso local.
 	Reference map[string]bool
 
-	Watcher     *watcher.Watcher
-	WatchActive bool
-	rootCtx     context.Context
-	rootCancel  context.CancelFunc
-	watchCancel context.CancelFunc
+	// Auto-track: se consulta Steam mientras la pantalla de logros está
+	// abierta y solo se marcan transiciones false→true.
+	Tracker     *autotrack.Tracker
+	AutoActive  bool
+	AutoWarning string
+	LastPoll    time.Time
+	PollErrors  int
 
 	width  int
 	height int
@@ -90,7 +98,7 @@ type Model struct {
 }
 
 // NewModel construye la TUI y, si hay juegos recientes, abre el último.
-func NewModel(cfg config.Config, store Store, api SteamAPI, notif *notifier.Notifier) Model {
+func NewModel(cfg config.Config, store Store, api SteamAPI, notif Notifier, snd SoundPlayer) Model {
 	input := textinput.New()
 	input.Placeholder = "49520 o https://store.steampowered.com/app/49520"
 	input.CharLimit = 200
@@ -102,19 +110,20 @@ func NewModel(cfg config.Config, store Store, api SteamAPI, notif *notifier.Noti
 	search.CharLimit = 120
 	search.Width = 46
 
-	ctx, cancel := context.WithCancel(context.Background())
-
 	m := Model{
-		Screen:     ScreenAppID,
-		Config:     cfg,
-		Store:      store,
-		Steam:      api,
-		Notifier:   notif,
-		Input:      input,
-		Search:     search,
-		Filter:     FilterAll,
-		rootCtx:    ctx,
-		rootCancel: cancel,
+		Screen:   ScreenAppID,
+		Config:   cfg,
+		Store:    store,
+		Steam:    api,
+		Notifier: notif,
+		Sound:    snd,
+		Input:    input,
+		Search:   search,
+		Filter:   FilterAll,
+		Tracker:  autotrack.New(),
+	}
+	if snd != nil {
+		m.SoundWarning = snd.Warning()
 	}
 
 	m.loadRecents()
@@ -157,4 +166,27 @@ func (m *Model) loadRecents() {
 	if m.RecentCursor >= len(items) {
 		m.RecentCursor = 0
 	}
+}
+
+// unlockedSet convierte el snapshot de Steam en el mapa que usa el badge.
+func unlockedSet(raw map[string]steam.PlayerAchievement) map[string]bool {
+	out := make(map[string]bool, len(raw))
+	for name, state := range raw {
+		if state.Unlocked {
+			out[name] = true
+		}
+	}
+	return out
+}
+
+// toStates adapta el snapshot de Steam al tracker.
+func toStates(raw map[string]steam.PlayerAchievement) map[string]autotrack.State {
+	out := make(map[string]autotrack.State, len(raw))
+	for name, state := range raw {
+		out[name] = autotrack.State{
+			Unlocked:   state.Unlocked,
+			UnlockedAt: state.UnlockTime,
+		}
+	}
+	return out
 }

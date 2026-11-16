@@ -119,7 +119,7 @@ func TestFetchPlayerAchievements(t *testing.T) {
 			t.Errorf("steamid = %q", got)
 		}
 		_, _ = w.Write([]byte(`{"playerstats":{"success":true,"achievements":[
-			{"apiname":"A","achieved":1},
+			{"apiname":"A","achieved":1,"unlocktime":1700000000},
 			{"apiname":"B","achieved":0}
 		]}}`))
 	})
@@ -128,8 +128,15 @@ func TestFetchPlayerAchievements(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchPlayerAchievements: %v", err)
 	}
-	if !completed["A"] || completed["B"] {
+	if !completed["A"].Unlocked || completed["B"].Unlocked {
 		t.Fatalf("mapa incorrecto: %+v", completed)
+	}
+	want := time.Unix(1700000000, 0).UTC()
+	if !completed["A"].UnlockTime.Equal(want) {
+		t.Fatalf("unlocktime = %v, quiero %v", completed["A"].UnlockTime, want)
+	}
+	if !completed["B"].UnlockTime.IsZero() {
+		t.Fatalf("un logro pendiente no debe tener unlocktime: %v", completed["B"].UnlockTime)
 	}
 }
 

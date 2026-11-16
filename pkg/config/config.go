@@ -20,6 +20,11 @@ const (
 	DefaultMaxVisibleCount = 15
 	// MaxRecentAppIDs es cuántos juegos recientes se recuerdan.
 	MaxRecentAppIDs = 5
+	// DefaultPollInterval es cada cuántos segundos se consulta Steam.
+	DefaultPollInterval = 30
+	// MinPollInterval y MaxPollInterval acotan el sondeo para no abusar de la API.
+	MinPollInterval = 10
+	MaxPollInterval = 300
 	// EnvAPIKey permite sobreescribir la API key sin tocar config.json.
 	EnvAPIKey = "FEATUI_STEAM_API_KEY"
 )
@@ -33,21 +38,29 @@ type Config struct {
 	Locale          string `json:"locale"`
 	MaxVisibleCount int    `json:"max_visible_count"`
 	Notify          bool   `json:"notify"`
-	WatchProfile    bool   `json:"watch_profile"`
+	AutoTrack       bool   `json:"auto_track"`
+	PollInterval    int    `json:"poll_interval"`
+	Sound           bool   `json:"sound"`
+	SoundFile       string `json:"sound_file"`
 	RecentAppIDs    []int  `json:"recent_app_ids"`
 }
 
 // fileConfig refleja config.json tal cual, incluida la clave legada
-// "default_app_id" que existía cuando solo se soportaba Borderlands 2.
+// "default_app_id" que existía cuando solo se soportaba Borderlands 2, y
+// "watch_profile" del watcher de guardado que ya no se usa.
 type fileConfig struct {
 	SteamAPIKey     string `json:"steam_api_key"`
 	SteamID64       string `json:"steam_id_64"`
 	Locale          string `json:"locale"`
 	MaxVisibleCount int    `json:"max_visible_count"`
 	Notify          *bool  `json:"notify"`
-	WatchProfile    *bool  `json:"watch_profile"`
+	AutoTrack       *bool  `json:"auto_track"`
+	PollInterval    int    `json:"poll_interval"`
+	Sound           *bool  `json:"sound"`
+	SoundFile       string `json:"sound_file"`
 	RecentAppIDs    []int  `json:"recent_app_ids"`
 	DefaultAppID    int    `json:"default_app_id"`
+	WatchProfile    *bool  `json:"watch_profile"`
 }
 
 // Dir devuelve el directorio de configuración de FeatUI.
@@ -109,7 +122,9 @@ func defaults() Config {
 		Locale:          DefaultLocale,
 		MaxVisibleCount: DefaultMaxVisibleCount,
 		Notify:          true,
-		WatchProfile:    false,
+		AutoTrack:       true,
+		PollInterval:    DefaultPollInterval,
+		Sound:           true,
 		RecentAppIDs:    []int{},
 	}
 }
@@ -132,19 +147,29 @@ func (c *Config) apply(raw fileConfig) bool {
 	if raw.Notify != nil {
 		c.Notify = *raw.Notify
 	}
-	if raw.WatchProfile != nil {
-		c.WatchProfile = *raw.WatchProfile
+	if raw.AutoTrack != nil {
+		c.AutoTrack = *raw.AutoTrack
+	}
+	if raw.PollInterval > 0 {
+		c.PollInterval = raw.PollInterval
+	}
+	if raw.Sound != nil {
+		c.Sound = *raw.Sound
+	}
+	if raw.SoundFile != "" {
+		c.SoundFile = strings.TrimSpace(raw.SoundFile)
 	}
 	if len(raw.RecentAppIDs) > 0 {
 		c.RecentAppIDs = append([]int(nil), raw.RecentAppIDs...)
 	}
 
-	// Migración desde la versión monojuego.
+	// Migración desde versiones anteriores. Ambas claves se eliminan al
+	// reescribir el archivo, porque Config ya no las declara.
 	if raw.DefaultAppID > 0 && len(c.RecentAppIDs) == 0 {
 		c.RecentAppIDs = []int{raw.DefaultAppID}
 	}
-	if raw.DefaultAppID != 0 {
-		changed = true // reescribir sin la clave legada
+	if raw.DefaultAppID != 0 || raw.WatchProfile != nil {
+		changed = true
 	}
 
 	return changed
@@ -164,6 +189,22 @@ func (c *Config) normalize() bool {
 	}
 	if c.SteamID64 != "" && !ValidSteamID(c.SteamID64) {
 		c.SteamID64 = ""
+		changed = true
+	}
+	if c.PollInterval <= 0 {
+		c.PollInterval = DefaultPollInterval
+		changed = true
+	}
+	if c.PollInterval < MinPollInterval {
+		c.PollInterval = MinPollInterval
+		changed = true
+	}
+	if c.PollInterval > MaxPollInterval {
+		c.PollInterval = MaxPollInterval
+		changed = true
+	}
+	if trimmed := strings.TrimSpace(c.SoundFile); trimmed != c.SoundFile {
+		c.SoundFile = trimmed
 		changed = true
 	}
 

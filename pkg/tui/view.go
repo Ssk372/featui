@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 )
@@ -148,6 +149,8 @@ func (m Model) viewAchievements() string {
 	} else if query := strings.TrimSpace(m.Search.Value()); query != "" {
 		b.WriteString(helpStyle.Render("  búsqueda: " + query))
 	}
+	b.WriteString("\n")
+	b.WriteString(helpStyle.Render("  auto: " + m.autoState()))
 	b.WriteString("\n\n")
 
 	if len(indexes) == 0 {
@@ -215,11 +218,24 @@ func (m Model) viewAchievements() string {
 	if m.Warning != "" {
 		b.WriteString("\n" + warnStyle.Render(" ⚠ "+m.Warning))
 	}
+	if m.AutoWarning != "" {
+		b.WriteString("\n" + warnStyle.Render(" ⚠ "+m.AutoWarning))
+	}
+	if m.SoundWarning != "" {
+		b.WriteString("\n" + warnStyle.Render(" ⚠ sound: "+m.SoundWarning))
+	}
 
 	if m.ConfirmReset {
 		b.WriteString("\n\n  " + confirmStyle.Render(fmt.Sprintf(
 			"¿Reiniciar los %d logros de %s?\nSe guardará un backup del progreso actual. [y/N]",
 			total, displayTitle(m.Game.Title, m.AppID),
+		)))
+	}
+
+	if m.ConfirmSync {
+		b.WriteString("\n\n  " + confirmStyle.Render(fmt.Sprintf(
+			"¿Marcar en local todos los logros que ya tienes desbloqueados en Steam?\n%s · no modifica nada en Steam. [y/N]",
+			displayTitle(m.Game.Title, m.AppID),
 		)))
 	}
 
@@ -238,9 +254,9 @@ func (m Model) helpLine() string {
 		return "  [escribe] filtrar · [↑/↓] mover · [enter/esc] cerrar búsqueda"
 	}
 	if m.width > 0 && m.width < 108 {
-		return "  [↑/↓] mover · [espacio] marcar · [/] buscar · [f] filtro · [?] ayuda · [q] salir"
+		return "  [↑/↓] mover · [espacio] marcar · [/] buscar · [f] filtro · [S] sincronizar · [?] ayuda · [q] salir"
 	}
-	return "  [↑/↓] mover · [espacio] marcar · [/] buscar · [f] filtro · [R] reiniciar · [r] recargar · [esc] volver · [?] ayuda · [q] salir"
+	return "  [↑/↓] mover · [espacio] marcar · [/] buscar · [f] filtro · [S] sync Steam · [R] reiniciar · [r] recargar · [esc] volver · [?] ayuda · [q] salir"
 }
 
 func (m Model) renderHelp() string {
@@ -251,26 +267,40 @@ func (m Model) renderHelp() string {
 		"  /             buscar por nombre o descripción",
 		"  f             alternar filtro: todos / pendientes / completados",
 		"  g / G         ir al principio / final",
+		"  S             sincronizar con Steam (pide confirmación)",
 		"  R             reiniciar la partida (pide confirmación)",
 		"  r             recargar el esquema desde Steam",
 		"  esc           volver a la pantalla de AppID",
 		"  ?             ocultar esta ayuda",
 		"",
-		"  " + m.watcherState(),
+		"  " + m.autoState(),
 	}
 	return strings.Join(lines, "\n")
 }
 
-func (m Model) watcherState() string {
+// autoState resume el estado del sondeo para la ayuda y la barra de estado.
+func (m Model) autoState() string {
+	if !m.Config.AutoTrack {
+		return "desactivado (auto_track = false)"
+	}
+	if m.Config.SteamID64 == "" {
+		return "no disponible: falta steam_id_64"
+	}
+
+	interval := shortDuration(time.Duration(m.Config.PollInterval) * time.Second)
+	last := "sin datos"
+	if !m.LastPoll.IsZero() {
+		last = m.LastPoll.Format("15:04")
+	}
+
+	suffix := fmt.Sprintf(" · %s · última sync %s", interval, last)
 	switch {
-	case !m.Config.WatchProfile:
-		return "watcher: desactivado (watch_profile = false)"
-	case m.Watcher == nil || !m.Watcher.Available():
-		return "watcher: no disponible para este juego"
-	case m.WatchActive:
-		return "watcher: activo · " + m.Watcher.Path()
+	case !m.AutoActive:
+		return "inactivo" + suffix
+	case len(m.AutoWarning) > 0:
+		return "con problemas" + suffix
 	default:
-		return "watcher: inactivo"
+		return "activo" + suffix
 	}
 }
 

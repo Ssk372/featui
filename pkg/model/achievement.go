@@ -9,7 +9,9 @@ type UnlockSource string
 const (
 	// SourceManual lo marcó el usuario desde la TUI.
 	SourceManual UnlockSource = "manual"
-	// SourceWatcher lo marcó una detección automática (reservado).
+	// SourceSteam lo detectó el auto-track o la sincronización con Steam.
+	SourceSteam UnlockSource = "steam"
+	// SourceWatcher es un valor legado de versiones anteriores.
 	SourceWatcher UnlockSource = "watcher"
 )
 
