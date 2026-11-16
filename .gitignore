@@ -1,0 +1,16 @@
+# Binarios
+/featui
+/featui-v2
+/dist/
+*.exe
+*.test
+*.out
+
+# Configuración local y secretos
+config.json
+.env
+.env.*
+*.local.json
+
+# Datos locales
+*_progress.json

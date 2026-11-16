@@ -1,0 +1,9 @@
+{
+  "steam_api_key": "TU_STEAM_API_KEY_AQUI",
+  "steam_id_64": "",
+  "locale": "spanish",
+  "max_visible_count": 15,
+  "notify": true,
+  "watch_profile": false,
+  "recent_app_ids": []
+}
