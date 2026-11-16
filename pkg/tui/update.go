@@ -102,9 +102,9 @@ func (m Model) openGameCmd(appIDValue int, force bool, seq int) tea.Cmd {
 					Achievements: fresh,
 				})
 			case hasCache:
-				warning = joinWarning(warning, "sin conexión con Steam; usando caché")
+				warning = joinWarning(warning, err.Error()+" · usando caché")
 			case localFound:
-				warning = joinWarning(warning, "sin conexión con Steam; mostrando progreso local")
+				warning = joinWarning(warning, err.Error()+" · mostrando progreso local")
 				return gameReadyMsg{Seq: seq, Progress: local, Warning: warning}
 			default:
 				return gameErrMsg{Seq: seq, AppID: appIDValue, Err: err}
