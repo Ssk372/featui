@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/Ssk372/featui/pkg/config"
 )
 
 var (
@@ -64,7 +66,7 @@ func (m Model) viewError() string {
 	}
 	if !m.Config.HasAPIKey() {
 		b.WriteString("\n\n  ")
-		b.WriteString(warnStyle.Render("Falta la API key: exporta FEATUI_STEAM_API_KEY o edita ~/.config/featui/config.json"))
+		b.WriteString(warnStyle.Render("⚠ " + missingAPIKeyHint()))
 	}
 	b.WriteString("\n\n")
 	b.WriteString(helpStyle.Render("  [r] reintentar · [esc] volver · [q] salir"))
@@ -104,7 +106,7 @@ func (m Model) viewAppID() string {
 
 	if !m.Config.HasAPIKey() {
 		b.WriteString("  ")
-		b.WriteString(warnStyle.Render("⚠ Falta la API key. Exporta FEATUI_STEAM_API_KEY o edita ~/.config/featui/config.json"))
+		b.WriteString(warnStyle.Render("⚠ " + missingAPIKeyHint()))
 		b.WriteString("\n\n")
 	}
 
@@ -393,4 +395,14 @@ func truncate(value string, limit int) string {
 		return string(runes[:limit])
 	}
 	return string(runes[:limit-1]) + "…"
+}
+
+// missingAPIKeyHint explica cómo configurar la clave usando la ruta real del
+// sistema, sin asumir Linux ni un shell concreto.
+func missingAPIKeyHint() string {
+	path, err := config.Path()
+	if err != nil {
+		path = "config.json"
+	}
+	return fmt.Sprintf("Falta la API key de Steam. Define %s o edita %s", config.EnvAPIKey, path)
 }

@@ -8,6 +8,12 @@ tus juegos con una lista local, ligera y sin tocar Steam.
 > descripciones, iconos) y guarda tu progreso en local. Es una herramienta para
 > revivir la experiencia de conseguirlos, no para modificarlos.
 
+> **Estado de las pruebas:** FeatUI solo se ha probado en **Linux**. Los
+> binarios de **Windows 10/11 y macOS** se compilan y publican, y el código
+> incluye soporte para ambos sistemas, pero **no se han probado en una máquina
+> real**: pueden aparecer bugs o problemas desconocidos. Si encuentras alguno,
+> abre un issue con tu sistema y lo que hiciste.
+
 ## Características
 
 - Multi-juego: escribe un AppID o pega una URL de Steam.
@@ -28,6 +34,52 @@ tus juegos con una lista local, ligera y sin tocar Steam.
 
 ## Instalación
 
+### Binarios listos para usar (recomendado)
+
+Descarga el `.zip` de la última release desde
+<https://github.com/Ssk372/featui/releases>. No necesitas Go ni cuenta de
+GitHub.
+
+| Sistema | Archivo |
+| --- | --- |
+| Windows 10/11 (64 bits) | `featui_windows_amd64.zip` |
+| Windows en ARM | `featui_windows_arm64.zip` |
+| Linux x86-64 | `featui_linux_amd64.zip` |
+| Linux ARM64 | `featui_linux_arm64.zip` |
+| macOS Intel | `featui_darwin_amd64.zip` |
+| macOS Apple Silicon | `featui_darwin_arm64.zip` |
+
+Cada zip incluye el ejecutable, `config.example.json`, este README,
+`WINDOWS.md` y la licencia. La release incluye además `SHA256SUMS` con los
+hashes de todos los archivos.
+
+**Windows:** sigue la guía paso a paso en [WINDOWS.md](WINDOWS.md).
+
+**Linux:**
+
+```bash
+unzip featui_linux_amd64.zip
+cd featui_linux_amd64
+chmod +x featui
+./featui
+```
+
+**macOS:**
+
+```bash
+unzip featui_darwin_arm64.zip   # o darwin_amd64 en Intel
+cd featui_darwin_arm64
+chmod +x featui
+xattr -d com.apple.quarantine featui   # si Gatekeeper lo bloquea
+./featui
+```
+
+El binario no está firmado, así que macOS puede pedir confirmación la primera
+vez. Si Gatekeeper sigue bloqueándolo: Ajustes → Privacidad y seguridad →
+«Abrir igualmente».
+
+### Desde el código fuente
+
 Requiere Go 1.27 o superior.
 
 ```bash
@@ -45,8 +97,12 @@ go install github.com/Ssk372/featui/cmd/featui@latest
 
 ## Configuración
 
-FeatUI crea su configuración en `~/.config/featui/config.json` la primera vez
-que se ejecuta:
+FeatUI crea su configuración la primera vez que se ejecuta, en el directorio de
+configuración del sistema:
+
+- Linux: `~/.config/featui/config.json`
+- Windows: `%AppData%\featui\config.json`
+- macOS: `~/Library/Application Support/featui/config.json`
 
 ```json
 {
@@ -83,24 +139,29 @@ que se ejecuta:
 Puedes evitar guardar la clave en disco con la variable de entorno:
 
 ```bash
+# Linux / macOS
 export FEATUI_STEAM_API_KEY="tu_clave"
+```
+
+```powershell
+# Windows (afecta a las terminales nuevas)
+setx FEATUI_STEAM_API_KEY "tu_clave"
 ```
 
 La variable tiene prioridad sobre el archivo y **nunca se escribe en él**.
 
 ### Dónde se guardan los datos
 
-| Ruta | Contenido |
-| --- | --- |
-| `~/.config/featui/config.json` | Configuración y API key. Permisos `0600`. |
-| `~/.local/share/featui/progress/<appid>.json` | Progreso local por juego. |
-| `~/.local/share/featui/progress/<appid>.json.bak` | Versión anterior del progreso. |
-| `~/.cache/featui/schema_<appid>_<locale>.json` | Caché del esquema de logros (24 h). |
-| `~/.cache/featui/icons/` | Iconos descargados para las notificaciones. |
+| Contenido | Linux | Windows |
+| --- | --- | --- |
+| Configuración | `~/.config/featui/config.json` | `%AppData%\featui\config.json` |
+| Progreso | `~/.local/share/featui/progress/` | `%LocalAppData%\featui\progress\` |
+| Backup del progreso | `<appid>.json.bak` junto al anterior | igual |
+| Caché de esquemas e iconos | `~/.cache/featui/` | `%LocalAppData%\featui\` |
 
-Todo respeta `XDG_CONFIG_HOME`, `XDG_DATA_HOME` y `XDG_CACHE_HOME` en Linux. En
-macOS se usa `~/Library/Application Support` y `~/Library/Caches`, y en Windows
-`%AppData%`, `%LocalAppData%` y la caché del usuario.
+En macOS: configuración y progreso en
+`~/Library/Application Support/featui/`, caché en `~/Library/Caches/featui/`.
+Todo respeta `XDG_CONFIG_HOME`, `XDG_DATA_HOME` y `XDG_CACHE_HOME` en Linux.
 
 ### Auto-desbloqueo
 
@@ -131,6 +192,26 @@ El orden de resolución es:
 Para reproducir se detecta automáticamente `pw-play`, `paplay`,
 `canberra-gtk-play`, `afplay`, `ffplay`, `mpv` o PowerShell `SoundPlayer`, según
 el sistema. La reproducción tiene un timeout de 3 s y nunca bloquea la TUI.
+
+## Windows
+
+Guía completa en [WINDOWS.md](WINDOWS.md). Resumen:
+
+1. Descarga `featui_windows_amd64.zip` y descomprímelo.
+2. Abre **Windows Terminal** en esa carpeta y ejecuta `.\featui.exe`.
+3. Si SmartScreen lo bloquea: «Más información» → «Ejecutar de todas formas».
+4. Consigue tu propia API key en <https://steamcommunity.com/dev/apikey> y
+   pégala en `%AppData%\featui\config.json`.
+5. El `steam_id_64` se detecta solo desde Steam; si no, ponlo a mano.
+6. Tu perfil de Steam debe ser público para el badge y el auto-track.
+
+## macOS
+
+1. Descarga el zip que corresponda a tu Mac (`arm64` para Apple Silicon).
+2. Descomprímelo y ejecuta `./featui` desde Terminal.
+3. Si Gatekeeper lo bloquea, usa `xattr -d com.apple.quarantine featui` o
+   Ajustes → Privacidad y seguridad → «Abrir igualmente».
+4. La configuración queda en `~/Library/Application Support/featui/config.json`.
 
 ## Controles
 
@@ -163,6 +244,16 @@ La lógica de fusión entre el esquema de Steam y el progreso local está en
 `pkg/model/merge.go` y tiene tests de regresión: Steam nunca puede desbloquear
 ni bloquear un logro por su cuenta.
 
+### Publicar una release
+
+El workflow `.github/workflows/release.yml` compila los seis binarios, los
+empaqueta y crea el release al empujar un tag:
+
+```bash
+git tag -a v0.2.0 -m "FeatUI v0.2.0"
+git push origin v0.2.0
+```
+
 ## Hoja de ruta
 
 - Selector de biblioteca con `GetOwnedGames` (SteamID64 + búsqueda).
@@ -176,6 +267,10 @@ achievement metadata and player state from the Steam Web API and keeps your
 progress in local JSON files. It does not unlock achievements on Steam and does
 not interact with Valve systems. While open, it can mirror new Steam unlocks
 generically for any game. Requires Go 1.27+.
+
+Prebuilt binaries are available for Windows, Linux and macOS. **Only Linux has
+been tested so far**; the Windows and macOS builds are provided as-is and may
+still have unknown bugs.
 
 ## Licencia
 
